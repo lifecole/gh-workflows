@@ -1,0 +1,107 @@
+name: Kustomize Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      kustomization_dir:
+        description: 'Relative kustomization.yml directory'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace to run kubectl with'
+        required: true
+        type: string
+      base_image_repository:
+        description: 'The base docker image repository (grc.io/my_project_id/my_org)'
+        required: true
+        type: string
+      images_tags:
+        description: 'Space separated "IMAGE:TAG" list'
+        type: string
+        required: true
+      deployments:
+        description: 'Space separated k8s DEPLOYMENT names'
+        type: string
+        required: true
+      has_env_secrets:
+        description: 'Whether the project as a .env.secret file for kustomize secrets'
+        type: boolean
+        required: false
+        default: false
+      aws_region:
+        description: 'AWS Region'
+        type: string
+        required: false
+        default: eu-west-1
+      k8s_cluster_name:
+        description: 'K8S Cluster Name'
+        type: string
+        required: true
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      GH_K8S_SECRETS:
+        required: false
+
+jobs:
+  kustomize_deploy:
+    name: Deploys an application using kustomize
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: eu-west-1
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Setup kubectl
+      run: |-
+        aws eks --region eu-west-1 update-kubeconfig --name ${K8S_CLUSTER_NAME}
+        # See https://github.com/aws/aws-cli/issues/6920
+        curl -L https://storage.googleapis.com/kubernetes-release/release/v1.23.6/bin/linux/amd64/kubectl \
+          -o /usr/local/bin/kubectl
+      env:
+        K8S_CLUSTER_NAME: ${{ inputs.k8s_cluster_name }}
+
+    - name: Set up Kustomize
+      run: |-
+        curl -sfLo /tmp/kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v3.1.0/kustomize_3.1.0_linux_amd64
+        chmod u+x /tmp/kustomize
+
+    - name: Deploy with kustomize
+      run: |-
+        cd "$KUSTOMIZATION_DIR"
+        if [ ! -z "${GH_K8S_SECRETS}" ]; then
+          echo "GH_K8S_SECRETS found, creating Secret..."
+          echo ${GH_K8S_SECRETS} > .env.secret.enc
+          cat .env.secret.enc | base64 -d > .env.secret
+        else
+          echo "No GH_K8S_SECRETS found, creating empty Secret..."
+          touch .env.secret
+        fi
+        for IMAGE_TAG in $IMAGES_TAGS; \
+          do IMAGE=$(echo "$IMAGE_TAG" | cut -d':' -f1) ; \
+          /tmp/kustomize edit set image "$BASE_IMAGE_REPOSITORY"/"$IMAGE"="$BASE_IMAGE_REPOSITORY"/"$IMAGE_TAG"; \
+          /tmp/kustomize edit set namespace "$NAMESPACE"; \
+        done
+        /tmp/kustomize build . | kubectl apply -f -
+        for DEPLOYMENT in $DEPLOYMENTS; do kubectl rollout status deployment/"$DEPLOYMENT" -n "$NAMESPACE"; done
+        kubectl -n "$NAMESPACE" get services -o wide
+      env:
+        KUSTOMIZATION_DIR: ${{ inputs.kustomization_dir }}
+        NAMESPACE: ${{ inputs.namespace }}
+        IMAGES_TAGS: ${{ inputs.images_tags }}
+        DEPLOYMENTS: ${{ inputs.deployments }}
+        BASE_IMAGE_REPOSITORY: ${{ inputs.base_image_repository }}
+        GH_K8S_SECRETS: ${{ secrets.GH_K8S_SECRETS }}
